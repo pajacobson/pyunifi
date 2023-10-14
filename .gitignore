@@ -11,3 +11,4 @@ Lib/
 .tox/
 .vscode/
 __pycache__
+.DS_Store
