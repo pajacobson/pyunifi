@@ -1,7 +1,6 @@
 MANIFEST
 build
 dist
-Scripts/
 .pypirc
 *.pyc
 pyunifi.egg-info
