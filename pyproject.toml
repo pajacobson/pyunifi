@@ -1,8 +1,32 @@
 [build-system]
-requires = ["setuptools >= 40.6.0", "wheel"]
+requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "pyunifi"
+version = "2.20.1"
+authors = [
+    {name = "Caleb Dunn", email = "finish.06@gmail.com"},
+]
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+]
+
+dependencies = [
+    "requests ~=2.22",
+    "urllib3 ~=2.0.0",
+]
 
 [tool.black]
 line-length = 79
-target-version = ['py39']
+target-version = ['py310']
+
+[tool.tox]
+legacy_tox_ini = """
+    [tox]
+    envlist =
+        lint
+    skip_missing_interpreters = True
+
+"""
