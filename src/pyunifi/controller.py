@@ -1,20 +1,22 @@
 """
 Python package to interact with UniFi Controller
 """
+import logging
 import shutil
 import time
 import warnings
-import json
-import logging
+from typing import List
 
 import requests
-from urllib3.exceptions import InsecureRequestWarning
+import urllib3
 
+urllib3.disable_warnings()
+logging.captureWarnings(True)
 
 """For testing purposes:
 logging.basicConfig(filename='pyunifi.log', level=logging.WARN,
                     format='%(asctime)s %(message)s')
-"""  # pylint: disable=W0105
+"""
 CONS_LOG = logging.getLogger(__name__)
 
 
@@ -22,7 +24,7 @@ class APIError(Exception):
     """API Error exceptions"""
 
 
-def retry_login(func, *args, **kwargs):  # pylint: disable=w0613
+def retry_login(func, *args, **kwargs):
     """To reattempt login if requests exception(s) occur at time of call"""
 
     def wrapper(*args, **kwargs):
@@ -32,7 +34,7 @@ def retry_login(func, *args, **kwargs):  # pylint: disable=w0613
             except (requests.exceptions.RequestException, APIError) as err:
                 CONS_LOG.warning("Failed to perform %s due to %s", func, err)
                 controller = args[0]
-                controller._login()  # pylint: disable=w0212
+                controller._login()
                 return func(*args, **kwargs)
         except Exception as err:
             raise APIError(err)
@@ -47,7 +49,7 @@ class Controller:  # pylint: disable=R0902,R0904
     Uses the JSON interface on port 8443 (HTTPS) to communicate with a UniFi
     controller. Operations will raise unifi.controller.APIError on obvious
     problems (such as login failure), but many errors (such as disconnecting a
-    nonexistant client) will go unreported.
+    non-existent client) will go unreported.
 
     >>> from unifi.controller import Controller
     >>> c = Controller('192.168.1.99', 'admin', 'p4ssw0rd')
@@ -60,15 +62,15 @@ class Controller:  # pylint: disable=R0902,R0904
 
     """
 
-    def __init__(  # pylint: disable=r0913
-            self,
-            host,
-            username,
-            password,
-            port=8443,
-            version="v5",
-            site_id="default",
-            ssl_verify=True,
+    def __init__(
+        self,
+        host,
+        username,
+        password,
+        port=8443,
+        version="v5",
+        site_id="default",
+        ssl_verify=True,
     ):
         """
         :param host: the address of the controller host; IP or name
@@ -95,9 +97,11 @@ class Controller:  # pylint: disable=R0902,R0904
         if version == "unifiOS":
             self.url = "https://" + host + "/proxy/network/"
             self.auth_url = self.url + "api/login"
+
         elif version == "UDMP-unifiOS":
-            self.auth_url = "https://" + host + "/api/auth/login"
-            self.url = "https://" + host + "/proxy/network/"
+            self.auth_url = f"https://{host}:{port}/api/auth/login"
+            self.url = f"https://{host}:{port}/proxy/network/"
+
         elif version[:1] == "v":
             if float(version[1:]) < 4:
                 raise APIError("%s controllers no longer supported" % version)
@@ -106,95 +110,100 @@ class Controller:  # pylint: disable=R0902,R0904
         else:
             raise APIError("%s controllers no longer supported" % version)
 
-        if ssl_verify is False:
-            warnings.simplefilter("default", category=InsecureRequestWarning)
+        # if ssl_verify is False:
+        #     warnings.simplefilter("default", category=InsecureRequestWarning)
 
         self.log.debug("Controller for %s", self.url)
-        self._login()
+
+        try:
+            self._login()
+
+        except APIError as e:
+            raise e
 
     @staticmethod
-    def _jsondec(data):
-        obj = json.loads(data)
-        if "meta" in obj:
-            if obj["meta"]["rc"] != "ok":
-                raise APIError(obj["meta"]["msg"])
-        if "data" in obj:
-            result = obj["data"]
-        else:
-            result = obj
+    def _jsondecode(response) -> dict:
+        obj = response.json()
 
-        return result
+        if "meta" in obj and obj["meta"]["rc"] != "ok":
+            raise APIError(obj["meta"]["msg"])
+
+        return obj.get("data", obj)
+
+    def _update_tokens(self, header: dict) -> None:
+        if "X-CSRF-Token" in header:
+            self.headers = {"X-CSRF-Token": header["X-CSRF-Token"]}
+
+    def _response_process(self, response) -> dict:
+        # Catch http error response
+        response.raise_for_status()
+
+        self._update_tokens(response.headers)
+
+        return self._jsondecode(response)
+
+    @retry_login
+    def _request(self, fn, url, params):
+        return getattr(self.session, fn)(
+            url,
+            **params,
+            headers=self.headers,
+        )
 
     def _api_url(self):
         return self.url + "api/s/" + self.site_id + "/"
 
-    @retry_login
-    def _read(self, url, params=None):
-        # Try block to handle the unifi server being offline.
-        response = self.session.get(url, params=params, headers=self.headers)
-
-        if response.headers.get("X-CSRF-Token"):
-            self.headers = {"X-CSRF-Token": response.headers["X-CSRF-Token"]}
-
-        return self._jsondec(response.text)
-
     def _api_read(self, url, params=None):
-        return self._read(self._api_url() + url, params)
-
-    @retry_login
-    def _write(self, url, params=None):
-        response = self.session.post(url, json=params, headers=self.headers)
-
-        if response.headers.get("X-CSRF-Token"):
-            self.headers = {"X-CSRF-Token": response.headers["X-CSRF-Token"]}
-
-        return self._jsondec(response.text)
+        return self._response_process(
+            self._request(
+                "get",
+                f"{self._api_url()}{url}",
+                {"params": params},
+            )
+        )
 
     def _api_write(self, url, params=None):
-        return self._write(self._api_url() + url, params)
-
-    @retry_login
-    def _update(self, url, params=None):
-        response = self.session.put(url, json=params, headers=self.headers)
-
-        if response.headers.get("X-CSRF-Token"):
-            self.headers = {"X-CSRF-Token": response.headers["X-CSRF-Token"]}
-
-        return self._jsondec(response.text)
+        return self._response_process(
+            self._request(
+                "post",
+                f"{self._api_url()}{url}",
+                {"json": params},
+            )
+        )
 
     def _api_update(self, url, params=None):
-        return self._update(self._api_url() + url, params)
-
-    @retry_login
-    def _delete(self, url, params=None):
-        response = self.session.delete(url, json=params, headers=self.headers)
-
-        if response.headers.get("X-CSRF-Token"):
-            self.headers = {"X-CSRF-Token": response.headers["X-CSRF-Token"]}
-
-        return self._jsondec(response.text)
+        return self._response_process(
+            self._request(
+                "put",
+                f"{self._api_url()}{url}",
+                {"json": params},
+            )
+        )
 
     def _api_delete(self, url, params=None):
-        return self._delete(self._api_url() + url, params)
+        return self._response_process(
+            self._request(
+                "delete",
+                f"{self._api_url()}{url}",
+                {"json": params},
+            )
+        )
 
     def _login(self):
         self.log.debug("login() as %s", self.username)
         self.session = requests.Session()
         self.session.verify = self.ssl_verify
 
-        response = self.session.post(
+        response = self._request(
+            "post",
             self.auth_url,
-            json={"username": self.username, "password": self.password},
-            headers=self.headers,
+            {"json": {"username": self.username, "password": self.password}},
         )
 
-        if response.headers.get("X-CSRF-Token"):
-            self.headers = {"X-CSRF-Token": response.headers["X-CSRF-Token"]}
+        self._update_tokens(response.headers)
 
         if response.status_code != 200:
-            raise APIError(
-                "Login failed - status code: %i" % response.status_code
-                )
+            raise APIError("Login failed - status code: %i" % response.status_code)
 
     def _logout(self):
         self.log.debug("logout()")
@@ -211,9 +220,7 @@ class Controller:  # pylint: disable=R0902,R0904
 
         # TODO: Not currently supported on UDMP as site support doesn't exist.
         if self.version == "UDMP-unifiOS":
-            raise APIError(
-                "Controller version not supported: %s" % self.version
-                )
+            raise APIError("Controller version not supported: %s" % self.version)
 
         for site in self.get_sites():
             if site["desc"] == name:
@@ -247,13 +254,16 @@ class Controller:  # pylint: disable=R0902,R0904
         """Return a list of all Events."""
         return self._api_read("stat/event")
 
+    def get_devices(self) -> List[dict]:
+        """Return list of UniFI Devices"""
+        return self._api_read("stat/device-basic")
+
     def get_aps(self):
         """Return a list of all APs,
         with significant information about each.
         """
-        # Set test to 0 instead of NULL
-        params = {"_depth": 2, "test": 0}
-        return self._api_read("stat/device", params)
+        devices = [d for d in self.get_devices() if d["type"] == "uap"]
+        return [self.get_device_stat(device.get("mac")) for device in devices]
 
     def get_client(self, mac):
         """Get details about a specific client"""
@@ -298,38 +308,49 @@ class Controller:  # pylint: disable=R0902,R0904
         """
         return self._api_read("list/wlanconf")
 
-    def _run_command(self, command, params=None, mgr="stamgr"):
+    def _run_command(
+        self,
+        command,
+        mgr="stamgr",
+        params=None,
+    ):
         if params is None:
             params = {}
         self.log.debug("_run_command(%s)", command)
         params.update({"cmd": command})
         return self._api_write("cmd/" + mgr, params=params)
 
-    def _mac_cmd(self, target_mac, command, mgr="stamgr", params=None):
+    def _mac_cmd(
+        self,
+        target_mac,
+        command,
+        mgr="stamgr",
+        params=None,
+    ):
         if params is None:
             params = {}
         self.log.debug("_mac_cmd(%s, %s)", target_mac, command)
         params["mac"] = target_mac
         return self._run_command(command, params, mgr)
 
-    def get_device_stat(self, target_mac):
+    def get_device_stat(self, target_mac: str):
         """Gets the current state & configuration of
         the given device based on its MAC Address.
         :param target_mac: MAC address of the device.
-        :type target_mac: str
+
         :returns: Dictionary containing metadata, state,
             capabilities and configuration of the device
         :rtype: dict()
         """
         self.log.debug("get_device_stat(%s)", target_mac)
-        params = {"macs": [target_mac]}
-        return self._api_read("stat/device/" + target_mac, params)[0]
+
+        return self._api_read(f"stat/device/{target_mac}")[0]
 
     def get_radius_users(self):
         """Return a list of all users, with their
         name, password, 24 digit user id, and 24 digit site id
         """
-        return self._api_read('rest/account')
+        return self._api_read("rest/account")
 
     def add_radius_user(self, name, password):
         """Add a new user with this username and password
@@ -337,8 +358,8 @@ class Controller:  # pylint: disable=R0902,R0904
         :param password: new user's password
         :returns: user's name, password, 24 digit user id, and 24 digit site id
         """
-        params = {'name': name, 'x_password': password}
-        return self._api_write('rest/account/', params)
+        params = {"name": name, "x_password": password}
+        return self._api_write("rest/account/", params)
 
     def update_radius_user(self, name, password, user_id):
         """Update a user to this new username and password
@@ -349,8 +370,8 @@ class Controller:  # pylint: disable=R0902,R0904
         :returns: user's name, password, 24 digit user id, and 24 digit site id
         :returns: [] if no change was made
         """
-        params = {'name': name, '_id': user_id, 'x_password': password}
-        return self._api_update('rest/account/' + user_id, params)
+        params = {"name": name, "_id": user_id, "x_password": password}
+        return self._api_update("rest/account/" + user_id, params)
 
     def delete_radius_user(self, user_id):
         """Delete user
@@ -358,7 +379,7 @@ class Controller:  # pylint: disable=R0902,R0904
             or add_radius_user()
         :returns: [] if successful
         """
-        return self._api_delete('rest/account/' + user_id)
+        return self._api_delete("rest/account/" + user_id)
 
     def get_switch_port_overrides(self, target_mac):
         """Gets a list of port overrides, in dictionary
@@ -375,7 +396,7 @@ class Controller:  # pylint: disable=R0902,R0904
         self.log.debug("get_switch_port_overrides(%s)", target_mac)
         return self.get_device_stat(target_mac)["port_overrides"]
 
-    def _switch_port_power(self, target_mac, port_idx, mode):
+    def _switch_port_power(self, target_mac: str, port_idx: int, mode):
         """Helper method to set the given PoE mode the port/switch.
 
         :param target_mac: MAC address of the Switch.
@@ -390,13 +411,13 @@ class Controller:  # pylint: disable=R0902,R0904
         """
         # TODO: Switch operations should most likely happen in a
         # different Class, Switch.
-        self.log.debug(
-            "_switch_port_power(%s, %s, %s)", target_mac, port_idx, mode
-            )
+
+        self.log.debug("_switch_port_power(%s, %s, %s)", target_mac, port_idx, mode)
         device_stat = self.get_device_stat(target_mac)
         device_id = device_stat.get("_id")
         overrides = device_stat.get("port_overrides")
         found = False
+
         if overrides:
             for i in overrides:
                 if overrides[i]["port_idx"] == port_idx:
@@ -404,23 +425,21 @@ class Controller:  # pylint: disable=R0902,R0904
                     overrides[i]["poe_mode"] = mode
                     found = True
                     break
+
         if not found:
             # Retrieve portconf
             portconf_id = None
+
             for port in device_stat["port_table"]:
                 if port["port_idx"] == port_idx:
                     portconf_id = port["portconf_id"]
                     break
+
             if portconf_id is None:
-                raise APIError(
-                    "Port ID %s not found in port_table" % str(port_idx)
-                    )
+                raise APIError("Port ID %s not found in port_table" % str(port_idx))
+
             overrides.append(
-                {
-                    "port_idx": port_idx,
-                    "portconf_id": portconf_id,
-                    "poe_mode": mode
-                    }
+                {"port_idx": port_idx, "portconf_id": portconf_id, "poe_mode": mode}
             )
         # We return the device_id as it's needed by the parent method
         return {"port_overrides": overrides, "device_id": device_id}
@@ -457,6 +476,7 @@ class Controller:  # pylint: disable=R0902,R0904
         params = self._switch_port_power(target_mac, port_idx, "auto")
         device_id = params["device_id"]
         del params["device_id"]
+
         return self._api_update("rest/device/" + device_id, params)
 
     def create_site(self, desc="desc"):
@@ -467,15 +487,9 @@ class Controller:  # pylint: disable=R0902,R0904
 
         # TODO: Not currently supported on UDMP as site support doesn't exist.
         if self.version == "UDMP-unifiOS":
-            raise APIError(
-                "Controller version not supported: %s" % self.version
-                )
+            raise APIError("Controller version not supported: %s" % self.version)
 
-        return self._run_command(
-            "add-site",
-            params={"desc": desc},
-            mgr="sitemgr"
-            )
+        return self._run_command("add-site", params={"desc": desc}, mgr="sitemgr")
 
     def block_client(self, mac):
         """Add a client to the block list.
@@ -517,8 +531,8 @@ class Controller:  # pylint: disable=R0902,R0904
             raise APIError("%s is not a valid name" % str(name))
         for access_point in self.get_aps():
             if (
-                    access_point.get("state", 0) == 1
-                    and access_point.get("name", None) == name
+                access_point.get("state", 0) == 1
+                and access_point.get("name", None) == name
             ):
                 result = self.restart_ap(access_point["mac"])
         return result
@@ -540,15 +554,9 @@ class Controller:  # pylint: disable=R0902,R0904
         :return: URL path to backup file
         """
         if self.version == "UDMP-unifiOS":
-            raise APIError(
-                "Controller version not supported: %s" % self.version
-                )
+            raise APIError("Controller version not supported: %s" % self.version)
 
-        res = self._run_command(
-            "backup",
-            mgr="system",
-            params={"days": days}
-            )
+        res = self._run_command("backup", mgr="system", params={"days": days})
         return res[0]["url"]
 
     # TODO: Not currently supported on UDMP as it now utilizes async-backups.
@@ -560,9 +568,7 @@ class Controller:  # pylint: disable=R0902,R0904
             backup archive to, should have .unf extension for restore.
         """
         if self.version == "UDMP-unifiOS":
-            raise APIError(
-                "Controller version not supported: %s" % self.version
-                )
+            raise APIError("Controller version not supported: %s" % self.version)
 
         if not download_path:
             download_path = self.create_backup()
@@ -576,13 +582,13 @@ class Controller:  # pylint: disable=R0902,R0904
             return shutil.copyfileobj(response.raw, _backfh)
 
     def authorize_guest(  # pylint: disable=R0913
-            self,
-            guest_mac,
-            minutes,
-            up_bandwidth=None,
-            down_bandwidth=None,
-            byte_quota=None,
-            ap_mac=None,
+        self,
+        guest_mac,
+        minutes,
+        up_bandwidth=None,
+        down_bandwidth=None,
+        byte_quota=None,
+        ap_mac=None,
     ):
         """
         Authorize a guest based on his MAC address.
@@ -615,19 +621,9 @@ class Controller:  # pylint: disable=R0902,R0904
         """
         cmd = "unauthorize-guest"
         params = {"mac": guest_mac}
-        return self._run_command(
-            cmd,
-            params=params
-            )
+        return self._run_command(cmd, params=params)
 
-    def get_firmware(
-            self,
-            cached=True,
-            available=True,
-            known=False,
-            site=False
-    ):
-
+    def get_firmware(self, cached=True, available=True, known=False, site=False):
         """
         Return a list of available/cached firmware versions
 
@@ -661,12 +657,7 @@ class Controller:  # pylint: disable=R0902,R0904
         :return: True/False
         """
         return self._run_command(
-            "download",
-            mgr="firmware",
-            params={
-                "device": device,
-                "version": version
-                }
+            "download", mgr="firmware", params={"device": device, "version": version}
         )[0]["result"]
 
     def remove_firmware(self, version, device):
@@ -681,12 +672,7 @@ class Controller:  # pylint: disable=R0902,R0904
         :return: True/false
         """
         return self._run_command(
-            "remove",
-            mgr="firmware",
-            params={
-                "device": device,
-                "version": version
-                }
+            "remove", mgr="firmware", params={"device": device, "version": version}
         )[0]["result"]
 
     def get_tag(self):
@@ -700,12 +686,7 @@ class Controller:  # pylint: disable=R0902,R0904
         :param version: version to upgrade to
         """
         self._mac_cmd(
-            mac,
-            "upgrade",
-            mgr="devmgr",
-            params={
-                "upgrade_to_firmware": version
-                }
+            mac, "upgrade", mgr="devmgr", params={"upgrade_to_firmware": version}
         )
 
     def provision(self, mac):
@@ -731,9 +712,9 @@ class Controller:  # pylint: disable=R0902,R0904
         for setting in all_settings:
             s_sect = setting["key"]
             if (
-                    (cs_settings and "site_id" in setting)
-                    or (not cs_settings and "site_id" not in setting)
-                    or (section and s_sect not in section)
+                (cs_settings and "site_id" in setting)
+                or (not cs_settings and "site_id" not in setting)
+                or (section and s_sect not in section)
             ):
                 continue
             for k in ("_id", "site_id", "key"):
@@ -792,14 +773,14 @@ class Controller:  # pylint: disable=R0902,R0904
         return self._api_update("rest/user/" + client, {"name": alias})
 
     def create_voucher(  # pylint: disable=R0913
-            self,
-            number,
-            quota,
-            expire,
-            up_bandwidth=None,
-            down_bandwidth=None,
-            byte_quota=None,
-            note=None,
+        self,
+        number,
+        quota,
+        expire,
+        up_bandwidth=None,
+        down_bandwidth=None,
+        byte_quota=None,
+        note=None,
     ):
         """
         Create voucher for guests.

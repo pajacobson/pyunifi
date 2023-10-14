@@ -10,3 +10,4 @@ pip-selfcheck.json
 Lib/
 .tox/
 .vscode/
+__pycache__
